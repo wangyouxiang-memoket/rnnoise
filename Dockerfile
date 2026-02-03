@@ -32,12 +32,18 @@ RUN rm -rf build && cmake -S . -B build \
   -DRNNOISE_BUILD_SHARED=ON \
   -DRNNOISE_BUILD_STATIC=OFF \
   -DRNNOISE_BUILD_EXAMPLES=ON \
-  -DRNNOISE_BUILD_TOOLS=ON
+  -DRNNOISE_BUILD_TOOLS=OFF
 RUN cmake --build build -j
 RUN cmake --install build --prefix /opt/rnnoise
 RUN mkdir -p /opt/rnnoise/bin /opt/rnnoise/models && \
   cp build/rnnoise_demo build/rnnoise_wrapper_demo /opt/rnnoise/bin/ && \
-  (cd build && ./dump_weights_blob && cp weights_blob.bin /opt/rnnoise/models/)
+  if [ -f build/dump_weights_blob ]; then \
+    (cd build && ./dump_weights_blob && cp weights_blob.bin /opt/rnnoise/models/); \
+  elif [ -f src/rnnoise_data.c ]; then \
+    echo "Model embedded in binary"; \
+  else \
+    echo "Warning: No model available" >&2; \
+  fi
 
 RUN pip3 install --no-cache-dir -r server/requirements.txt
 
