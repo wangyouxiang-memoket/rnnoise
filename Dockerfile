@@ -45,7 +45,7 @@ RUN mkdir -p /opt/rnnoise/bin /opt/rnnoise/models && \
     echo "Warning: No model available" >&2; \
   fi
 
-RUN pip3 install --no-cache-dir -r server/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r server/requirements.txt
 
 FROM debian:bookworm-slim
 
