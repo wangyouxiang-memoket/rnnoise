@@ -12,6 +12,13 @@ from pydub import AudioSegment
 
 APP = FastAPI(title="rnnoise-http")
 
+print("=" * 50)
+print("RNNoise Server Starting...")
+print(f"MAX_CONCURRENCY: {os.getenv('MAX_CONCURRENCY', '4')}")
+print(f"RNNOISE_BIN: {os.getenv('RNNOISE_BIN', '/opt/rnnoise/bin/rnnoise_wrapper_demo')}")
+print(f"AWS_REGION: {os.getenv('AWS_REGION', 'us-east-1')}")
+print("=" * 50)
+
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 RNNOISE_BIN = os.getenv("RNNOISE_BIN", "/opt/rnnoise/bin/rnnoise_wrapper_demo")
 DEFAULT_MODEL = os.getenv("RNNOISE_MODEL", "/opt/rnnoise/models/weights_blob.bin")
@@ -113,6 +120,7 @@ def _convert_from_pcm(
 
 @APP.get("/health")
 async def health() -> dict:
+    print("[HEALTH] Health check called")
     return {
         "status": "ok",
         "active_requests": _active_requests,
@@ -229,6 +237,8 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
     """S3-based denoise: read from S3, process, write back to S3
     Automatically detects format from file extension and preserves it.
     """
+    print("[S3] ===== NEW REQUEST RECEIVED =====")
+    print(f"[S3] Request data: {req}")
     global _active_requests
 
     print(f"[S3] Received request: {req.input_s3_uri} -> {req.output_s3_uri}")
