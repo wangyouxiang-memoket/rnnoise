@@ -212,6 +212,8 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
     """
     global _active_requests
     
+    print(f"[S3] Received request: {req.input_s3_uri} -> {req.output_s3_uri}")
+    
     if _active_requests >= MAX_CONCURRENCY:
         raise HTTPException(
             status_code=503,
@@ -221,6 +223,7 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
     try:
         input_bucket, input_key = _parse_s3_uri(req.input_s3_uri)
         output_bucket, output_key = _parse_s3_uri(req.output_s3_uri)
+        print(f"[S3] Parsed - Bucket: {input_bucket}, Key: {input_key}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -231,6 +234,7 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Detect format from input file extension
                 audio_format = _detect_audio_format(input_key)
+                print(f"[S3] Detected format: {audio_format}")
                 
                 if audio_format:
                     # Multi-format workflow
@@ -249,9 +253,11 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
 
                 try:
                     # Download input from S3
+                    print(f"[S3] Downloading from S3: {input_bucket}/{input_key}")
                     await loop.run_in_executor(
                         None, _s3_client.download_file, input_bucket, input_key, input_file
                     )
+                    print(f"[S3] Download complete")
 
                     # Download model if specified
                     if req.model_s3_uri:
@@ -261,31 +267,43 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                             None, _s3_client.download_file, model_bucket, model_key, model_path
                         )
                     elif os.path.exists(DEFAULT_MODEL):
-                        model_path = DEFAULT_MODEL
-
                     # Convert to PCM if needed
                     if audio_format:
+                        print(f"[S3] Converting {audio_format} to PCM")
                         sample_rate, channels = await loop.run_in_executor(
                             None, _convert_to_pcm, input_file, input_pcm, audio_format
                         )
+                        print(f"[S3] Conversion complete: {sample_rate}Hz, {channels}ch")
                     
                     # Process with rnnoise
+                    print(f"[S3] Processing with rnnoise")
                     await loop.run_in_executor(None, _run_rnnoise, input_pcm, output_pcm, model_path)
-
                     # Convert back to original format if needed
                     if audio_format:
+                        print(f"[S3] Converting PCM back to {audio_format}")
                         await loop.run_in_executor(
                             None, _convert_from_pcm, output_pcm, output_file, audio_format, sample_rate, channels
                         )
+                        print(f"[S3] Conversion back complete")
                     
+                    # Upload to S3
+                    print(f"[S3] Uploading to S3: {output_bucket}/{output_key}")
+                    await loop.run_in_executor(
+                        None, _s3_client.upload_file, output_file, output_bucket, output_key
+                    )
+                    print(f"[S3] Upload complete")
                     # Upload to S3
                     await loop.run_in_executor(
                         None, _s3_client.upload_file, output_file, output_bucket, output_key
                     )
 
                 except ClientError as exc:
+                    print(f"[S3] S3 Error: {exc}")
                     raise HTTPException(status_code=500, detail=f"S3 error: {exc}") from exc
                 except Exception as exc:
+                    print(f"[S3] Error: {exc}")
+                    import traceback
+                    traceback.print_exc()
                     raise HTTPException(status_code=500, detail=str(exc)) from exc
 
             return {
