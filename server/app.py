@@ -114,8 +114,22 @@ def _convert_from_pcm(
         sample_width=2,  # 16-bit = 2 bytes
     )
 
-    # Export to target format
-    audio.export(output_path, format=target_format)
+    # Export to target format with proper codec settings
+    if target_format == "m4a":
+        # M4A needs ipod format and aac codec
+        audio.export(output_path, format="ipod", codec="aac", bitrate="128k")
+    elif target_format == "mp3":
+        audio.export(output_path, format="mp3", bitrate="128k")
+    elif target_format == "ogg":
+        audio.export(output_path, format="ogg", codec="libvorbis")
+    elif target_format == "flac":
+        audio.export(output_path, format="flac")
+    elif target_format == "wav":
+        audio.export(output_path, format="wav")
+    elif target_format == "aac":
+        audio.export(output_path, format="adts", codec="aac", bitrate="128k")
+    else:
+        audio.export(output_path, format=target_format)
 
 
 @APP.get("/health")
