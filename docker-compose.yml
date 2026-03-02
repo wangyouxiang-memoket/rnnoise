@@ -14,8 +14,16 @@ services:
     working_dir: /data
     environment:
       RNNOISE_MODE: ${RNNOISE_MODE:-server}
-      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-4}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
       RNNOISE_MODEL: ${RNNOISE_MODEL:-/opt/rnnoise/models/weights_blob.bin}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    # Performance optimizations
+    cpus: "4.0"
+    mem_limit: 4g
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G

@@ -28,7 +28,7 @@ logger.info(f"RNNOISE_BIN: {os.getenv('RNNOISE_BIN', '/opt/rnnoise/bin/rnnoise_w
 logger.info(f"AWS_REGION: {os.getenv('AWS_REGION', 'us-east-1')}")
 logger.info("=" * 50)
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))  # Increased from 4 to 8
 RNNOISE_BIN = os.getenv("RNNOISE_BIN", "/opt/rnnoise/bin/rnnoise_wrapper_demo")
 DEFAULT_MODEL = os.getenv("RNNOISE_MODEL", "/opt/rnnoise/models/weights_blob.bin")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -73,6 +73,17 @@ def _parse_s3_uri(s3_uri: str) -> tuple:
 
 
 def _run_rnnoise(input_path: str, output_path: str, model_path: Optional[str]) -> None:
+    """Run rnnoise with progress logging for long files"""
+    import os
+    
+    # Get file size to estimate duration
+    file_size = os.path.getsize(input_path)
+    # 48kHz, mono, 16-bit = 96,000 bytes/sec
+    estimated_duration = file_size / 96000
+    
+    if estimated_duration > 60:  # Log for files > 1 minute
+        logger.info(f"Processing large file (~{estimated_duration/60:.1f} min), this may take a while...")
+    
     args = [RNNOISE_BIN, input_path, output_path]
     if model_path:
         args.append(model_path)
@@ -100,16 +111,24 @@ def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tup
     
     logger.info(f"Original audio: {original_sample_rate}Hz, {original_channels}ch, duration={len(audio)}ms")
 
-    # RNNoise works best with 48kHz mono, but can work with other rates
-    # Use 48kHz for processing if original is higher, otherwise keep original
-    rnnoise_sample_rate = 48000 if original_sample_rate >= 48000 else original_sample_rate
+    # RNNoise is hardcoded for 48kHz (FRAME_SIZE=480 = 10ms at 48kHz)
+    # Always use 48kHz for optimal performance and quality
+    # The resampling overhead (1-4s) is negligible compared to denoise time
+    rnnoise_sample_rate = 48000
     rnnoise_channels = 1  # Always convert to mono for denoising
+    
+    if original_sample_rate != 48000:
+        logger.info(f"Resampling {original_sample_rate}Hz → 48000Hz (RNNoise requirement)")
+    if original_channels > 1:
+        logger.info(f"Converting {original_channels}ch → mono for processing")
 
     # Convert to mono and set sample rate
     audio = audio.set_channels(rnnoise_channels).set_frame_rate(rnnoise_sample_rate)
 
-    # Export as raw PCM (s16le format)
-    audio.export(output_path, format="s16le", parameters=["-f", "s16le"])
+    # Export as raw PCM (s16le format) - use raw export for speed
+    pcm_data = audio.raw_data
+    with open(output_path, 'wb') as f:
+        f.write(pcm_data)
     
     elapsed = time.time() - start_time
     logger.info(f"Conversion to PCM: {rnnoise_sample_rate}Hz, {rnnoise_channels}ch (took {elapsed:.2f}s)")

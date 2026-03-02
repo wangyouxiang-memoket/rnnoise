@@ -3,6 +3,10 @@ FROM debian:bookworm-slim AS builder
 ARG MODEL_URL_BASE
 ENV MODEL_URL_BASE=${MODEL_URL_BASE}
 
+# Optimization level: safe, balanced (default), or aggressive
+ARG OPTIMIZE_LEVEL=balanced
+ENV OPTIMIZE_LEVEL=${OPTIMIZE_LEVEL}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -28,12 +32,14 @@ RUN set -e; \
   done
 
 RUN rm -rf build && cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DRNNOISE_OPTIMIZE_LEVEL=${OPTIMIZE_LEVEL} \
   -DRNNOISE_ENABLE_X86_RTCD=ON \
   -DRNNOISE_BUILD_SHARED=ON \
   -DRNNOISE_BUILD_STATIC=OFF \
   -DRNNOISE_BUILD_EXAMPLES=ON \
   -DRNNOISE_BUILD_TOOLS=OFF
-RUN cmake --build build -j
+RUN cmake --build build -j$(nproc)
 RUN cmake --install build --prefix /opt/rnnoise
 RUN mkdir -p /opt/rnnoise/bin /opt/rnnoise/models && \
   cp build/rnnoise_demo build/rnnoise_wrapper_demo /opt/rnnoise/bin/ && \

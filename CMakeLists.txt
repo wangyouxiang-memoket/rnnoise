@@ -48,6 +48,30 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Performance optimizations
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Allow customization via environment variable
+set(RNNOISE_OPTIMIZE_LEVEL "balanced" CACHE STRING "Optimization level: safe, balanced, or aggressive")
+
+if(RNNOISE_OPTIMIZE_LEVEL STREQUAL "aggressive")
+  # Maximum speed: use ONLY if building and running on same CPU
+  message(STATUS "Using aggressive optimizations (CPU-specific, -ffast-math)")
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -mtune=native -ffast-math -DNDEBUG -funroll-loops -finline-functions -fomit-frame-pointer")
+elseif(RNNOISE_OPTIMIZE_LEVEL STREQUAL "safe")
+  # Safe and portable: works on any modern x86-64 CPU
+  message(STATUS "Using safe optimizations (portable)")
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -march=x86-64 -mtune=generic -DNDEBUG")
+else()
+  # Balanced (default): good speed, reasonable portability (2013+ CPUs)
+  message(STATUS "Using balanced optimizations (x86-64-v2: SSE4.2, works on 2013+ CPUs)")
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -march=x86-64-v2 -mtune=generic -DNDEBUG -funroll-loops -finline-functions")
+endif()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pipe")
+
 if(RNNOISE_ENABLE_X86_RTCD AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86"))
   list(APPEND RNNOISE_SOURCES ${RNNOISE_X86_SOURCES})
   add_compile_definitions(RNN_ENABLE_X86_RTCD CPU_INFO_BY_ASM)
