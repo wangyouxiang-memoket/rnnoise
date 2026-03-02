@@ -2,6 +2,8 @@ import asyncio
 import os
 import tempfile
 from typing import Optional
+import logging
+import time
 
 import boto3
 from botocore.exceptions import ClientError
@@ -10,14 +12,21 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from pydub import AudioSegment
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 APP = FastAPI(title="rnnoise-http")
 
-print("=" * 50)
-print("RNNoise Server Starting...")
-print(f"MAX_CONCURRENCY: {os.getenv('MAX_CONCURRENCY', '4')}")
-print(f"RNNOISE_BIN: {os.getenv('RNNOISE_BIN', '/opt/rnnoise/bin/rnnoise_wrapper_demo')}")
-print(f"AWS_REGION: {os.getenv('AWS_REGION', 'us-east-1')}")
-print("=" * 50)
+logger.info("=" * 50)
+logger.info("RNNoise Server Starting...")
+logger.info(f"MAX_CONCURRENCY: {os.getenv('MAX_CONCURRENCY', '4')}")
+logger.info(f"RNNOISE_BIN: {os.getenv('RNNOISE_BIN', '/opt/rnnoise/bin/rnnoise_wrapper_demo')}")
+logger.info(f"AWS_REGION: {os.getenv('AWS_REGION', 'us-east-1')}")
+logger.info("=" * 50)
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 RNNOISE_BIN = os.getenv("RNNOISE_BIN", "/opt/rnnoise/bin/rnnoise_wrapper_demo")
@@ -82,13 +91,14 @@ def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tup
     """Convert audio file to PCM format for rnnoise processing
     Returns: (original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels)
     """
+    start_time = time.time()
     audio = AudioSegment.from_file(input_path, format=audio_format)
     
     # Store original parameters
     original_sample_rate = audio.frame_rate
     original_channels = audio.channels
     
-    print(f"[CONVERT] Original: {original_sample_rate}Hz, {original_channels}ch, duration={len(audio)}ms")
+    logger.info(f"Original audio: {original_sample_rate}Hz, {original_channels}ch, duration={len(audio)}ms")
 
     # RNNoise works best with 48kHz mono, but can work with other rates
     # Use 48kHz for processing if original is higher, otherwise keep original
@@ -101,7 +111,8 @@ def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tup
     # Export as raw PCM (s16le format)
     audio.export(output_path, format="s16le", parameters=["-f", "s16le"])
     
-    print(f"[CONVERT] Processing: {rnnoise_sample_rate}Hz, {rnnoise_channels}ch")
+    elapsed = time.time() - start_time
+    logger.info(f"Conversion to PCM: {rnnoise_sample_rate}Hz, {rnnoise_channels}ch (took {elapsed:.2f}s)")
 
     return original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels
 
@@ -116,7 +127,8 @@ def _convert_from_pcm(
     original_channels: int,
 ) -> None:
     """Convert PCM back to target audio format, restoring original parameters"""
-    print(f"[CONVERT] Reading processed PCM: {processing_sample_rate}Hz, {processing_channels}ch")
+    start_time = time.time()
+    logger.info(f"Reading processed PCM: {processing_sample_rate}Hz, {processing_channels}ch")
     
     # Read raw PCM data
     audio = AudioSegment.from_file(
@@ -130,12 +142,12 @@ def _convert_from_pcm(
     # Restore original sample rate and channels if different
     if processing_sample_rate != original_sample_rate:
         audio = audio.set_frame_rate(original_sample_rate)
-        print(f"[CONVERT] Restored sample rate to {original_sample_rate}Hz")
+        logger.info(f"Restored sample rate to {original_sample_rate}Hz")
     
     # Note: Keeping mono since denoising was done in mono
     # Converting back to stereo from mono wouldn't add information
     
-    print(f"[CONVERT] Exporting to {target_format}")
+    logger.info(f"Exporting to {target_format}")
 
     # Export to target format with proper codec settings and quality
     if target_format == "m4a":
@@ -162,12 +174,13 @@ def _convert_from_pcm(
     else:
         audio.export(output_path, format=target_format)
     
-    print(f"[CONVERT] Export complete")
+    elapsed = time.time() - start_time
+    logger.info(f"Conversion from PCM complete (took {elapsed:.2f}s)")
 
 
 @APP.get("/health")
 async def health() -> dict:
-    print("[HEALTH] Health check called")
+    logger.info("Health check called")
     return {
         "status": "ok",
         "active_requests": _active_requests,
@@ -286,11 +299,11 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
     """S3-based denoise: read from S3, process, write back to S3
     Automatically detects format from file extension and preserves it.
     """
-    print("[S3] ===== NEW REQUEST RECEIVED =====")
-    print(f"[S3] Request data: {req}")
+    request_start = time.time()
+    logger.info("===== NEW S3 REQUEST RECEIVED =====")
+    logger.info(f"Input: {req.input_s3_uri}")
+    logger.info(f"Output: {req.output_s3_uri}")
     global _active_requests
-
-    print(f"[S3] Received request: {req.input_s3_uri} -> {req.output_s3_uri}")
 
     if _active_requests >= MAX_CONCURRENCY:
         raise HTTPException(
@@ -301,7 +314,7 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
     try:
         input_bucket, input_key = _parse_s3_uri(req.input_s3_uri)
         output_bucket, output_key = _parse_s3_uri(req.output_s3_uri)
-        print(f"[S3] Parsed - Bucket: {input_bucket}, Key: {input_key}")
+        logger.info(f"Parsed S3 - Bucket: {input_bucket}, Key: {input_key}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -312,7 +325,7 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Detect format from input file extension
                 audio_format = _detect_audio_format(input_key)
-                print(f"[S3] Detected format: {audio_format}")
+                logger.info(f"Detected format: {audio_format}")
 
                 if audio_format:
                     # Multi-format workflow
@@ -331,7 +344,8 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
 
                 try:
                     # Download input from S3
-                    print(f"[S3] Downloading from S3: {input_bucket}/{input_key}")
+                    download_start = time.time()
+                    logger.info(f"Downloading from S3: {input_bucket}/{input_key}")
                     await loop.run_in_executor(
                         None,
                         _s3_client.download_file,
@@ -339,7 +353,7 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                         input_key,
                         input_file,
                     )
-                    print(f"[S3] Download complete")
+                    logger.info(f"Download complete (took {time.time() - download_start:.2f}s)")
 
                     # Download model if specified
                     if req.model_s3_uri:
@@ -357,24 +371,22 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
 
                     # Convert to PCM if needed
                     if audio_format:
-                        print(f"[S3] Converting {audio_format} to PCM")
+                        logger.info(f"Converting {audio_format} to PCM...")
                         orig_sr, orig_ch, proc_sr, proc_ch = await loop.run_in_executor(
                             None, _convert_to_pcm, input_file, input_pcm, audio_format
                         )
-                        print(
-                            f"[S3] Conversion complete: original={orig_sr}Hz/{orig_ch}ch, processing={proc_sr}Hz/{proc_ch}ch"
-                        )
 
                     # Process with rnnoise
-                    print(f"[S3] Processing with rnnoise")
+                    denoise_start = time.time()
+                    logger.info(f"Starting RNNoise processing...")
                     await loop.run_in_executor(
                         None, _run_rnnoise, input_pcm, output_pcm, model_path
                     )
-                    print(f"[S3] Processing complete")
+                    logger.info(f"RNNoise processing complete (took {time.time() - denoise_start:.2f}s)")
                     
                     # Convert back to original format if needed
                     if audio_format:
-                        print(f"[S3] Converting PCM back to {audio_format}")
+                        logger.info(f"Converting PCM back to {audio_format}...")
                         await loop.run_in_executor(
                             None,
                             _convert_from_pcm,
@@ -386,10 +398,10 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                             orig_sr,
                             orig_ch,
                         )
-                        print(f"[S3] Conversion back complete")
 
                     # Upload to S3
-                    print(f"[S3] Uploading to S3: {output_bucket}/{output_key}")
+                    upload_start = time.time()
+                    logger.info(f"Uploading to S3: {output_bucket}/{output_key}")
                     await loop.run_in_executor(
                         None,
                         _s3_client.upload_file,
@@ -397,33 +409,25 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                         output_bucket,
                         output_key,
                     )
-                    print(f"[S3] Upload complete")
-                    # Upload to S3
-                    await loop.run_in_executor(
-                        None,
-                        _s3_client.upload_file,
-                        output_file,
-                        output_bucket,
-                        output_key,
-                    )
+                    logger.info(f"Upload complete (took {time.time() - upload_start:.2f}s)")
 
                 except ClientError as exc:
-                    print(f"[S3] S3 Error: {exc}")
+                    logger.error(f"S3 Error: {exc}")
                     raise HTTPException(
                         status_code=500, detail=f"S3 error: {exc}"
                     ) from exc
                 except Exception as exc:
-                    print(f"[S3] Error: {exc}")
-                    import traceback
-
-                    traceback.print_exc()
+                    logger.error(f"Error during processing: {exc}", exc_info=True)
                     raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+            total_time = time.time() - request_start
+            logger.info(f"===== REQUEST COMPLETE (total time: {total_time:.2f}s) =====")
             return {
                 "status": "success",
                 "input": req.input_s3_uri,
                 "output": req.output_s3_uri,
                 "format": audio_format if audio_format else "pcm",
+                "processing_time": round(total_time, 2),
             }
         finally:
             _active_requests -= 1
