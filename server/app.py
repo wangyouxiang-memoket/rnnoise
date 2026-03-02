@@ -80,49 +80,80 @@ def _detect_audio_format(file_path: str) -> Optional[str]:
 
 def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tuple:
     """Convert audio file to PCM format for rnnoise processing
-    Returns: (sample_rate, channels)
+    Returns: (original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels)
     """
     audio = AudioSegment.from_file(input_path, format=audio_format)
+    
+    # Store original parameters
+    original_sample_rate = audio.frame_rate
+    original_channels = audio.channels
+    
+    print(f"[CONVERT] Original: {original_sample_rate}Hz, {original_channels}ch, duration={len(audio)}ms")
 
-    # Export as raw PCM: 16-bit, mono, 48kHz (rnnoise typical settings)
-    sample_rate = 48000
-    channels = 1
+    # RNNoise works best with 48kHz mono, but can work with other rates
+    # Use 48kHz for processing if original is higher, otherwise keep original
+    rnnoise_sample_rate = 48000 if original_sample_rate >= 48000 else original_sample_rate
+    rnnoise_channels = 1  # Always convert to mono for denoising
 
     # Convert to mono and set sample rate
-    audio = audio.set_frame_rate(sample_rate).set_channels(channels)
+    audio = audio.set_channels(rnnoise_channels).set_frame_rate(rnnoise_sample_rate)
 
-    # Export as raw PCM
+    # Export as raw PCM (s16le format)
     audio.export(output_path, format="s16le", parameters=["-f", "s16le"])
+    
+    print(f"[CONVERT] Processing: {rnnoise_sample_rate}Hz, {rnnoise_channels}ch")
 
-    return sample_rate, channels
+    return original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels
 
 
 def _convert_from_pcm(
     input_pcm_path: str,
     output_path: str,
     target_format: str,
-    sample_rate: int = 48000,
-    channels: int = 1,
+    processing_sample_rate: int,
+    processing_channels: int,
+    original_sample_rate: int,
+    original_channels: int,
 ) -> None:
-    """Convert PCM back to target audio format"""
+    """Convert PCM back to target audio format, restoring original parameters"""
+    print(f"[CONVERT] Reading processed PCM: {processing_sample_rate}Hz, {processing_channels}ch")
+    
     # Read raw PCM data
     audio = AudioSegment.from_file(
         input_pcm_path,
         format="s16le",
-        frame_rate=sample_rate,
-        channels=channels,
+        frame_rate=processing_sample_rate,
+        channels=processing_channels,
         sample_width=2,  # 16-bit = 2 bytes
     )
+    
+    # Restore original sample rate and channels if different
+    if processing_sample_rate != original_sample_rate:
+        audio = audio.set_frame_rate(original_sample_rate)
+        print(f"[CONVERT] Restored sample rate to {original_sample_rate}Hz")
+    
+    # Note: Keeping mono since denoising was done in mono
+    # Converting back to stereo from mono wouldn't add information
+    
+    print(f"[CONVERT] Exporting to {target_format}")
 
-    # Export to target format with proper codec settings
+    # Export to target format with proper codec settings and quality
     if target_format == "m4a":
-        # M4A needs ipod format and aac codec
-        audio.export(output_path, format="ipod", codec="aac", bitrate="128k")
+        # M4A with AAC codec - use better quality settings
+        audio.export(
+            output_path, 
+            format="ipod",
+            codec="aac",
+            bitrate="128k",
+            parameters=["-strict", "experimental"]
+        )
     elif target_format == "mp3":
-        audio.export(output_path, format="mp3", bitrate="128k")
+        # MP3 with good quality
+        audio.export(output_path, format="mp3", bitrate="128k", parameters=["-q:a", "2"])
     elif target_format == "ogg":
-        audio.export(output_path, format="ogg", codec="libvorbis")
+        audio.export(output_path, format="ogg", codec="libvorbis", parameters=["-q:a", "5"])
     elif target_format == "flac":
+        # FLAC is lossless
         audio.export(output_path, format="flac")
     elif target_format == "wav":
         audio.export(output_path, format="wav")
@@ -130,6 +161,8 @@ def _convert_from_pcm(
         audio.export(output_path, format="adts", codec="aac", bitrate="128k")
     else:
         audio.export(output_path, format=target_format)
+    
+    print(f"[CONVERT] Export complete")
 
 
 @APP.get("/health")
@@ -197,7 +230,7 @@ async def denoise_direct(request: Request) -> Response:
                         f.write(body)
 
                     # Convert to PCM
-                    sample_rate, channels = await loop.run_in_executor(
+                    orig_sr, orig_ch, proc_sr, proc_ch = await loop.run_in_executor(
                         None, _convert_to_pcm, original_file, input_pcm, audio_format
                     )
 
@@ -213,8 +246,10 @@ async def denoise_direct(request: Request) -> Response:
                         output_pcm,
                         output_file,
                         audio_format,
-                        sample_rate,
-                        channels,
+                        proc_sr,
+                        proc_ch,
+                        orig_sr,
+                        orig_ch,
                     )
 
                     # Read output file
@@ -323,11 +358,11 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                     # Convert to PCM if needed
                     if audio_format:
                         print(f"[S3] Converting {audio_format} to PCM")
-                        sample_rate, channels = await loop.run_in_executor(
+                        orig_sr, orig_ch, proc_sr, proc_ch = await loop.run_in_executor(
                             None, _convert_to_pcm, input_file, input_pcm, audio_format
                         )
                         print(
-                            f"[S3] Conversion complete: {sample_rate}Hz, {channels}ch"
+                            f"[S3] Conversion complete: original={orig_sr}Hz/{orig_ch}ch, processing={proc_sr}Hz/{proc_ch}ch"
                         )
 
                     # Process with rnnoise
@@ -335,6 +370,8 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                     await loop.run_in_executor(
                         None, _run_rnnoise, input_pcm, output_pcm, model_path
                     )
+                    print(f"[S3] Processing complete")
+                    
                     # Convert back to original format if needed
                     if audio_format:
                         print(f"[S3] Converting PCM back to {audio_format}")
@@ -344,8 +381,10 @@ async def denoise_s3(req: DenoiseRequest) -> dict:
                             output_pcm,
                             output_file,
                             audio_format,
-                            sample_rate,
-                            channels,
+                            proc_sr,
+                            proc_ch,
+                            orig_sr,
+                            orig_ch,
                         )
                         print(f"[S3] Conversion back complete")
 
