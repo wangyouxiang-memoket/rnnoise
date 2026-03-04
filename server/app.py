@@ -12,19 +12,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from pydub import AudioSegment
 
-# Suppress ffmpeg noisy stderr output (e.g. repeated "Header missing" warnings).
-# Monkey-patch pydub's converter call to inject "-loglevel error" into every ffmpeg invocation.
-import pydub.audio_segment as _pydub_as
-_orig_popen = _pydub_as.subprocess.Popen
-class _QuietPopen(_orig_popen):
-    def __init__(self, cmd, *args, **kwargs):
-        if isinstance(cmd, list) and len(cmd) > 0 and "ffmpeg" in str(cmd[0]):
-            # Insert -loglevel error right after the ffmpeg binary
-            if "-loglevel" not in cmd:
-                cmd = [cmd[0], "-loglevel", "error"] + cmd[1:]
-        super().__init__(cmd, *args, **kwargs)
-_pydub_as.subprocess.Popen = _QuietPopen
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -32,17 +19,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress ffmpeg noisy stderr output (e.g. repeated "Header missing" warnings).
+# pydub logs every line of ffmpeg stderr through the "pydub.converter" logger at
+# DEBUG level via log_subprocess_output() in pydub/logging_utils.py.
+# Since our root logger is at INFO, these DEBUG messages are already filtered —
+# but if anyone enables DEBUG on root, the spam returns. Pin the pydub logger to
+# WARNING so only real errors come through, regardless of global log level.
+logging.getLogger("pydub.converter").setLevel(logging.WARNING)
+
 APP = FastAPI(title="rnnoise-http")
 
 logger.info("=" * 50)
 logger.info("RNNoise Server Starting...")
-logger.info(f"MAX_CONCURRENCY: {os.getenv('MAX_CONCURRENCY', '4')}")
+logger.info(f"MAX_CONCURRENCY: {os.getenv('MAX_CONCURRENCY', '2')}")
 logger.info(f"RNNOISE_BIN: {os.getenv('RNNOISE_BIN', '/opt/rnnoise/bin/rnnoise_parallel_demo')}")
 logger.info(f"RNNOISE_MAX_THREADS: {os.getenv('RNNOISE_MAX_THREADS', 'auto (cpu_count)')}")
 logger.info(f"AWS_REGION: {os.getenv('AWS_REGION', 'us-east-1')}")
 logger.info("=" * 50)
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 RNNOISE_BIN = os.getenv("RNNOISE_BIN", "/opt/rnnoise/bin/rnnoise_parallel_demo")
 DEFAULT_MODEL = os.getenv("RNNOISE_MODEL", "/opt/rnnoise/models/weights_blob.bin")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
