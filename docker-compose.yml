@@ -23,9 +23,9 @@ services:
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
     # Performance optimizations
     cpus: "2.0"
-    mem_limit: 2g
+    mem_limit: 4g
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 2G
+          memory: 4G

@@ -10,7 +10,8 @@ from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
-from pydub import AudioSegment
+import subprocess as _subprocess
+import json as _json
 
 # Configure logging
 logging.basicConfig(
@@ -18,14 +19,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Suppress ffmpeg noisy stderr output (e.g. repeated "Header missing" warnings).
-# pydub logs every line of ffmpeg stderr through the "pydub.converter" logger at
-# DEBUG level via log_subprocess_output() in pydub/logging_utils.py.
-# Since our root logger is at INFO, these DEBUG messages are already filtered —
-# but if anyone enables DEBUG on root, the spam returns. Pin the pydub logger to
-# WARNING so only real errors come through, regardless of global log level.
-logging.getLogger("pydub.converter").setLevel(logging.WARNING)
 
 APP = FastAPI(title="rnnoise-http")
 
@@ -151,121 +144,90 @@ def _detect_audio_format(file_path: str) -> Optional[str]:
     return EXTENSION_TO_FORMAT.get(ext)
 
 
-def _probe_audio_format(file_path: str) -> Optional[str]:
-    """Use ffprobe to detect actual audio codec, regardless of file extension"""
-    import subprocess
+def _probe_audio_format(file_path: str) -> Optional[dict]:
+    """Use ffprobe to detect audio stream info: codec, sample_rate, channels.
+    Returns a dict or None on failure."""
     try:
-        result = subprocess.run(
+        result = _subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", "-select_streams", "a:0", file_path],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
-            import json
-            info = json.loads(result.stdout)
+            info = _json.loads(result.stdout)
             streams = info.get("streams", [])
             if streams:
-                codec = streams[0].get("codec_name", "")
-                logger.info(f"ffprobe detected codec: {codec}")
-                return codec
+                s = streams[0]
+                probe = {
+                    "codec": s.get("codec_name", ""),
+                    "sample_rate": int(s.get("sample_rate", 0)),
+                    "channels": int(s.get("channels", 0)),
+                }
+                logger.info(f"ffprobe: codec={probe['codec']}, "
+                            f"{probe['sample_rate']}Hz, {probe['channels']}ch")
+                return probe
     except Exception as e:
         logger.warning(f"ffprobe failed: {e}")
     return None
 
 
 def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tuple:
-    """Convert audio file to PCM format for rnnoise processing
-    Returns: (original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels)
+    """Convert audio file to 48kHz mono s16le PCM using ffmpeg subprocess.
+    No Python memory usage — ffmpeg streams directly to disk.
+    Returns: (original_sample_rate, original_channels, 48000, 1)
     """
     start_time = time.time()
-    
-    # First, probe the actual codec to avoid format mismatch issues
-    # (e.g. file has .mp3 extension but is actually AAC)
-    actual_codec = _probe_audio_format(input_path)
-    
-    # Warn if file extension doesn't match actual codec
-    if actual_codec:
-        # Map common codec names to format names for comparison
+
+    # Probe original audio properties
+    probe = _probe_audio_format(input_path)
+    if probe:
+        original_sample_rate = probe["sample_rate"] or 44100
+        original_channels = probe["channels"] or 2
+        actual_codec = probe["codec"]
+
+        # Warn on format mismatch
         _codec_to_format = {
             "aac": ["aac", "m4a"], "mp3": ["mp3"], "vorbis": ["ogg"],
             "opus": ["ogg", "opus"], "flac": ["flac"], "pcm_s16le": ["wav", "pcm"],
             "pcm_s16be": ["wav"], "wmav2": ["wma"], "amr_nb": ["amr"],
         }
-        expected_formats = _codec_to_format.get(actual_codec, [])
-        if expected_formats and audio_format not in expected_formats:
+        expected = _codec_to_format.get(actual_codec, [])
+        if expected and audio_format not in expected:
             logger.warning(
-                f"⚠️ Format mismatch: file extension is '.{audio_format}' "
-                f"but actual codec is '{actual_codec}' (expected: {expected_formats}). "
-                f"Will use auto-detect to load correctly."
+                f"⚠️ Format mismatch: extension '.{audio_format}' but codec "
+                f"'{actual_codec}' (expected: {expected}). ffmpeg will auto-detect."
             )
-    
-    audio = None
-    errors = []
-    
-    # Try loading strategies in order of reliability:
-    # 1. Let ffmpeg auto-detect (most reliable, ignores extension)
-    # 2. Use the probed codec name
-    # 3. Use the file extension as format hint
-    for attempt, (fmt, desc) in enumerate([
-        (None, "auto-detect"),
-        (actual_codec, f"probed codec '{actual_codec}'"),
-        (audio_format, f"extension '{audio_format}'"),
-    ]):
-        if fmt is False or (attempt > 0 and fmt is None):
-            continue
-        try:
-            if fmt:
-                audio = AudioSegment.from_file(input_path, format=fmt)
-            else:
-                audio = AudioSegment.from_file(input_path)
-            logger.info(f"Loaded audio via {desc}")
-            break
-        except Exception as e:
-            errors.append(f"{desc}: {e}")
-            logger.warning(f"Load attempt {attempt+1} ({desc}) failed: {e}")
-    
-    if audio is None:
-        raise RuntimeError(f"Failed to load audio file after all attempts: {'; '.join(errors)}")
-    
-    # Store original parameters
-    original_sample_rate = audio.frame_rate
-    original_channels = audio.channels
-    
-    logger.info(f"Original audio: {original_sample_rate}Hz, {original_channels}ch, duration={len(audio)}ms")
+    else:
+        original_sample_rate = 44100
+        original_channels = 2
+        logger.warning("ffprobe failed, assuming 44100Hz stereo")
 
-    # RNNoise is hardcoded for 48kHz (FRAME_SIZE=480 = 10ms at 48kHz)
-    # Always use 48kHz for optimal performance and quality
-    # The resampling overhead (1-4s) is negligible compared to denoise time
-    rnnoise_sample_rate = 48000
-    rnnoise_channels = 1  # Always convert to mono for denoising
-    
+    logger.info(f"Original audio: {original_sample_rate}Hz, {original_channels}ch")
     if original_sample_rate != 48000:
-        logger.info(f"Resampling {original_sample_rate}Hz → 48000Hz (RNNoise requirement)")
+        logger.info(f"Resampling {original_sample_rate}Hz → 48000Hz")
     if original_channels > 1:
-        logger.info(f"Converting {original_channels}ch → mono for processing")
+        logger.info(f"Converting {original_channels}ch → mono")
 
-    # Convert to mono and set sample rate
-    audio = audio.set_channels(rnnoise_channels).set_frame_rate(rnnoise_sample_rate)
-
-    # Export as raw PCM (s16le format)
-    # Use pydub export to ensure correct format
-    audio.export(
+    # Use ffmpeg to convert directly to 48kHz mono s16le PCM
+    # -loglevel error: suppress noisy warnings (e.g. "Header missing")
+    # -ac 1: mono, -ar 48000: 48kHz, -f s16le -acodec pcm_s16le: raw PCM
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", input_path,
+        "-ac", "1", "-ar", "48000",
+        "-f", "s16le", "-acodec", "pcm_s16le",
         output_path,
-        format="s16le",
-        codec="pcm_s16le",
-        parameters=["-f", "s16le", "-acodec", "pcm_s16le"]
-    )
-    
-    # Verify output
-    import os
-    pcm_size = os.path.getsize(output_path)
-    expected_size = len(audio.raw_data)
-    logger.info(f"PCM export: {pcm_size} bytes (expected ~{expected_size})")
-    
-    elapsed = time.time() - start_time
-    logger.info(f"Conversion to PCM: {rnnoise_sample_rate}Hz, {rnnoise_channels}ch (took {elapsed:.2f}s)")
+    ]
+    logger.info(f"Running: {' '.join(cmd)}")
+    result = _subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg PCM conversion failed (code {result.returncode}): {result.stderr}")
 
-    return original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels
+    pcm_size = os.path.getsize(output_path)
+    elapsed = time.time() - start_time
+    logger.info(f"PCM export: {pcm_size} bytes (took {elapsed:.2f}s)")
+
+    return original_sample_rate, original_channels, 48000, 1
 
 
 def _convert_from_pcm(
@@ -277,69 +239,55 @@ def _convert_from_pcm(
     original_sample_rate: int,
     original_channels: int,
 ) -> None:
-    """Convert PCM back to target audio format, restoring original parameters"""
+    """Convert denoised PCM back to target audio format using ffmpeg subprocess.
+    No Python memory usage — ffmpeg streams directly from/to disk.
+    """
     start_time = time.time()
-    logger.info(f"Reading processed PCM: {processing_sample_rate}Hz, {processing_channels}ch")
-    
-    # Verify PCM file exists and has data
-    import os
+
     if not os.path.exists(input_pcm_path):
         raise RuntimeError(f"Processed PCM file not found: {input_pcm_path}")
-    
     pcm_size = os.path.getsize(input_pcm_path)
     if pcm_size == 0:
-        raise RuntimeError(f"Processed PCM file is empty")
-    
-    logger.info(f"PCM file size: {pcm_size} bytes")
-    
-    # Read raw PCM data - use from_raw for better control
-    with open(input_pcm_path, 'rb') as f:
-        pcm_data = f.read()
-    
-    audio = AudioSegment(
-        data=pcm_data,
-        sample_width=2,  # 16-bit = 2 bytes
-        frame_rate=processing_sample_rate,
-        channels=processing_channels
-    )
-    
-    # Restore original sample rate and channels if different
-    if processing_sample_rate != original_sample_rate:
-        audio = audio.set_frame_rate(original_sample_rate)
-        logger.info(f"Restored sample rate to {original_sample_rate}Hz")
-    
-    # Note: Keeping mono since denoising was done in mono
-    # Converting back to stereo from mono wouldn't add information
-    
-    logger.info(f"Exporting to {target_format}")
+        raise RuntimeError("Processed PCM file is empty")
+    logger.info(f"PCM file: {pcm_size} bytes, {processing_sample_rate}Hz {processing_channels}ch")
 
-    # Export to target format with proper codec settings and quality
+    # Build ffmpeg command: read raw PCM → resample → encode
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        # Input: raw PCM format
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", str(processing_sample_rate),
+        "-ac", str(processing_channels),
+        "-i", input_pcm_path,
+        # Resample to original rate (denoised audio stays mono)
+        "-ar", str(original_sample_rate),
+    ]
+
+    # Format-specific output options
     if target_format == "m4a":
-        # M4A with AAC codec - use better quality settings
-        audio.export(
-            output_path, 
-            format="ipod",
-            codec="aac",
-            bitrate="128k",
-            parameters=["-strict", "experimental"]
-        )
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-strict", "experimental", "-f", "ipod"]
     elif target_format == "mp3":
-        # MP3 with good quality
-        audio.export(output_path, format="mp3", bitrate="128k", parameters=["-q:a", "2"])
+        cmd += ["-c:a", "libmp3lame", "-b:a", "128k", "-q:a", "2"]
     elif target_format == "ogg":
-        audio.export(output_path, format="ogg", codec="libvorbis", parameters=["-q:a", "5"])
+        cmd += ["-c:a", "libvorbis", "-q:a", "5"]
     elif target_format == "flac":
-        # FLAC is lossless
-        audio.export(output_path, format="flac")
+        cmd += ["-c:a", "flac"]
     elif target_format == "wav":
-        audio.export(output_path, format="wav")
+        cmd += ["-c:a", "pcm_s16le", "-f", "wav"]
     elif target_format == "aac":
-        audio.export(output_path, format="adts", codec="aac", bitrate="128k")
-    else:
-        audio.export(output_path, format=target_format)
-    
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-f", "adts"]
+    # else: let ffmpeg guess from extension
+
+    cmd.append(output_path)
+
+    logger.info(f"Running: {' '.join(cmd)}")
+    result = _subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg encode failed (code {result.returncode}): {result.stderr}")
+
     elapsed = time.time() - start_time
-    logger.info(f"Conversion from PCM complete (took {elapsed:.2f}s)")
+    output_size = os.path.getsize(output_path)
+    logger.info(f"Encoded {target_format}: {output_size} bytes (took {elapsed:.2f}s)")
 
 
 @APP.get("/health")
