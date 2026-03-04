@@ -12,6 +12,19 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from pydub import AudioSegment
 
+# Suppress ffmpeg noisy stderr output (e.g. repeated "Header missing" warnings).
+# Monkey-patch pydub's converter call to inject "-loglevel error" into every ffmpeg invocation.
+import pydub.audio_segment as _pydub_as
+_orig_popen = _pydub_as.subprocess.Popen
+class _QuietPopen(_orig_popen):
+    def __init__(self, cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) > 0 and "ffmpeg" in str(cmd[0]):
+            # Insert -loglevel error right after the ffmpeg binary
+            if "-loglevel" not in cmd:
+                cmd = [cmd[0], "-loglevel", "error"] + cmd[1:]
+        super().__init__(cmd, *args, **kwargs)
+_pydub_as.subprocess.Popen = _QuietPopen
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -143,19 +156,81 @@ def _detect_audio_format(file_path: str) -> Optional[str]:
     return EXTENSION_TO_FORMAT.get(ext)
 
 
+def _probe_audio_format(file_path: str) -> Optional[str]:
+    """Use ffprobe to detect actual audio codec, regardless of file extension"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "a:0", file_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            import json
+            info = json.loads(result.stdout)
+            streams = info.get("streams", [])
+            if streams:
+                codec = streams[0].get("codec_name", "")
+                logger.info(f"ffprobe detected codec: {codec}")
+                return codec
+    except Exception as e:
+        logger.warning(f"ffprobe failed: {e}")
+    return None
+
+
 def _convert_to_pcm(input_path: str, output_path: str, audio_format: str) -> tuple:
     """Convert audio file to PCM format for rnnoise processing
     Returns: (original_sample_rate, original_channels, rnnoise_sample_rate, rnnoise_channels)
     """
     start_time = time.time()
     
-    try:
-        # Try to load with explicit format first
-        audio = AudioSegment.from_file(input_path, format=audio_format)
-    except Exception as e:
-        logger.warning(f"Failed to load with format={audio_format}, trying auto-detect: {e}")
-        # Fallback: let ffmpeg auto-detect
-        audio = AudioSegment.from_file(input_path)
+    # First, probe the actual codec to avoid format mismatch issues
+    # (e.g. file has .mp3 extension but is actually AAC)
+    actual_codec = _probe_audio_format(input_path)
+    
+    # Warn if file extension doesn't match actual codec
+    if actual_codec:
+        # Map common codec names to format names for comparison
+        _codec_to_format = {
+            "aac": ["aac", "m4a"], "mp3": ["mp3"], "vorbis": ["ogg"],
+            "opus": ["ogg", "opus"], "flac": ["flac"], "pcm_s16le": ["wav", "pcm"],
+            "pcm_s16be": ["wav"], "wmav2": ["wma"], "amr_nb": ["amr"],
+        }
+        expected_formats = _codec_to_format.get(actual_codec, [])
+        if expected_formats and audio_format not in expected_formats:
+            logger.warning(
+                f"⚠️ Format mismatch: file extension is '.{audio_format}' "
+                f"but actual codec is '{actual_codec}' (expected: {expected_formats}). "
+                f"Will use auto-detect to load correctly."
+            )
+    
+    audio = None
+    errors = []
+    
+    # Try loading strategies in order of reliability:
+    # 1. Let ffmpeg auto-detect (most reliable, ignores extension)
+    # 2. Use the probed codec name
+    # 3. Use the file extension as format hint
+    for attempt, (fmt, desc) in enumerate([
+        (None, "auto-detect"),
+        (actual_codec, f"probed codec '{actual_codec}'"),
+        (audio_format, f"extension '{audio_format}'"),
+    ]):
+        if fmt is False or (attempt > 0 and fmt is None):
+            continue
+        try:
+            if fmt:
+                audio = AudioSegment.from_file(input_path, format=fmt)
+            else:
+                audio = AudioSegment.from_file(input_path)
+            logger.info(f"Loaded audio via {desc}")
+            break
+        except Exception as e:
+            errors.append(f"{desc}: {e}")
+            logger.warning(f"Load attempt {attempt+1} ({desc}) failed: {e}")
+    
+    if audio is None:
+        raise RuntimeError(f"Failed to load audio file after all attempts: {'; '.join(errors)}")
     
     # Store original parameters
     original_sample_rate = audio.frame_rate
