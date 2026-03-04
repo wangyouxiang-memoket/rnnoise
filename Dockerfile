@@ -42,7 +42,7 @@ RUN rm -rf build && cmake -S . -B build \
 RUN cmake --build build -j$(nproc)
 RUN cmake --install build --prefix /opt/rnnoise
 RUN mkdir -p /opt/rnnoise/bin /opt/rnnoise/models && \
-  cp build/rnnoise_demo build/rnnoise_wrapper_demo /opt/rnnoise/bin/ && \
+  cp build/rnnoise_demo build/rnnoise_wrapper_demo build/rnnoise_parallel_demo /opt/rnnoise/bin/ && \
   if [ -f build/dump_weights_blob ]; then \
     (cd build && ./dump_weights_blob && cp weights_blob.bin /opt/rnnoise/models/); \
   elif [ -f src/rnnoise_data.c ]; then \
