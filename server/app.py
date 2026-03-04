@@ -107,11 +107,13 @@ def _run_rnnoise(input_path: str, output_path: str, model_path: Optional[str]) -
         with _rnnoise_budget_lock:
             available = _rnnoise_thread_budget
             if available >= 2:
-                # Allocate up to 4 threads, but reserve at least 1 for other requests
-                allocated_threads = min(4, available - 1)
+                # Use all available threads (up to 4) for this request.
+                # Don't hold back — if another request comes in while this one
+                # is running, it will simply get 1 thread (single-threaded).
+                allocated_threads = min(4, available)
                 _rnnoise_thread_budget -= allocated_threads
             else:
-                # Budget exhausted or nearly so: this request gets 1 thread (single-threaded)
+                # Budget exhausted: this request gets 1 thread (single-threaded)
                 # Don't deduct from budget since 1 thread is the baseline
                 allocated_threads = 1
                 need_budget = False  # nothing extra to return later
